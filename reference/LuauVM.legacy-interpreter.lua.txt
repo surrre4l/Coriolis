@@ -1,0 +1,1545 @@
+--!nonstrict
+
+local Lexer = (function()
+-- ============================================================
+-- LuauVM :: Lexer
+-- Tokenizes Luau-ish source into a flat token stream.
+-- ============================================================
+
+local Lexer = {}
+
+local KEYWORDS = {
+	["and"] = true, ["break"] = true, ["do"] = true, ["else"] = true,
+	["elseif"] = true, ["end"] = true, ["false"] = true, ["for"] = true,
+	["function"] = true, ["if"] = true, ["in"] = true, ["local"] = true,
+	["nil"] = true, ["not"] = true, ["or"] = true, ["repeat"] = true,
+	["return"] = true, ["then"] = true, ["true"] = true, ["until"] = true,
+	["while"] = true, ["continue"] = true,
+}
+
+local function isDigit(c) return c and c >= "0" and c <= "9" end
+local function isAlpha(c) return c and ((c >= "a" and c <= "z") or (c >= "A" and c <= "Z") or c == "_") end
+local function isAlnum(c) return c and (isAlpha(c) or isDigit(c)) end
+
+function Lexer.new(source)
+	local self = setmetatable({}, { __index = Lexer })
+	self.src = source
+	self.pos = 1
+	self.len = #source
+	self.line = 1
+	self.tokens = {}
+	return self
+end
+
+function Lexer:peek(offset)
+	local p = self.pos + (offset or 0)
+	if p > self.len then return nil end
+	return self.src:sub(p, p)
+end
+
+function Lexer:advance()
+	local c = self:peek()
+	self.pos = self.pos + 1
+	if c == "\n" then self.line = self.line + 1 end
+	return c
+end
+
+function Lexer:match(c)
+	if self:peek() == c then
+		self:advance()
+		return true
+	end
+	return false
+end
+
+function Lexer:errorf(fmt, ...)
+	error(("LuauVM lex error [line %d]: %s"):format(self.line, fmt:format(...)), 0)
+end
+
+-- Reads a long bracket [[ ]] / [=[ ]=] etc starting at an already-consumed '['.
+-- Returns the content, or nil if this isn't actually a long-bracket opener.
+function Lexer:tryReadLongBracket()
+	local start = self.pos
+	local startLine = self.line
+	if self:peek() ~= "[" then return nil end
+	local p = self.pos + 1
+	local level = 0
+	while self.src:sub(p, p) == "=" do
+		level = level + 1
+		p = p + 1
+	end
+	if self.src:sub(p, p) ~= "[" then
+		return nil -- not a long bracket after all
+	end
+	-- consume opener
+	self.pos = p + 1
+	-- skip first newline immediately after opener
+	if self:peek() == "\r" then self:advance() end
+	if self:peek() == "\n" then self:advance() end
+	local buf = {}
+	local closer = "]" .. string.rep("=", level) .. "]"
+	while true do
+		if self.pos > self.len then
+			self.line = startLine
+			self:errorf("unterminated long bracket")
+		end
+		if self:peek() == "]" then
+			local maybe = self.src:sub(self.pos, self.pos + #closer - 1)
+			if maybe == closer then
+				for _ = 1, #closer do self:advance() end
+				return table.concat(buf)
+			end
+		end
+		table.insert(buf, self:advance())
+	end
+end
+
+function Lexer:skipWhitespaceAndComments()
+	while true do
+		local c = self:peek()
+		if c == " " or c == "\t" or c == "\r" or c == "\n" then
+			self:advance()
+		elseif c == "-" and self:peek(1) == "-" then
+			self:advance(); self:advance()
+			if self:peek() == "[" then
+				local savedPos, savedLine = self.pos, self.line
+				local content = self:tryReadLongBracket()
+				if content ~= nil then
+					-- long comment consumed
+				else
+					self.pos, self.line = savedPos, savedLine
+					while self:peek() and self:peek() ~= "\n" do self:advance() end
+				end
+			else
+				while self:peek() and self:peek() ~= "\n" do self:advance() end
+			end
+		else
+			break
+		end
+	end
+end
+
+function Lexer:readString(quote)
+	local buf = {}
+	while true do
+		local c = self:peek()
+		if c == nil then self:errorf("unterminated string") end
+		if c == quote then
+			self:advance()
+			break
+		elseif c == "\n" then
+			self:errorf("unterminated string")
+		elseif c == "\\" then
+			self:advance()
+			local e = self:advance()
+			if e == "n" then table.insert(buf, "\n")
+			elseif e == "t" then table.insert(buf, "\t")
+			elseif e == "r" then table.insert(buf, "\r")
+			elseif e == "a" then table.insert(buf, "\a")
+			elseif e == "b" then table.insert(buf, "\b")
+			elseif e == "f" then table.insert(buf, "\f")
+			elseif e == "v" then table.insert(buf, "\v")
+			elseif e == "\\" then table.insert(buf, "\\")
+			elseif e == "\"" then table.insert(buf, "\"")
+			elseif e == "'" then table.insert(buf, "'")
+			elseif e == "\n" then table.insert(buf, "\n")
+			elseif e == "z" then
+				-- skip following whitespace
+				while self:peek() and self:peek():match("%s") do self:advance() end
+			elseif isDigit(e) then
+				local numStr = e
+				for _ = 1, 2 do
+					if isDigit(self:peek()) then numStr = numStr .. self:advance() else break end
+				end
+				table.insert(buf, string.char(tonumber(numStr) % 256))
+			elseif e == "x" then
+				local h = (self:advance() or "0") .. (self:advance() or "0")
+				table.insert(buf, string.char(tonumber(h, 16) or 0))
+			else
+				table.insert(buf, e or "")
+			end
+		else
+			table.insert(buf, self:advance())
+		end
+	end
+	return table.concat(buf)
+end
+
+function Lexer:readNumber()
+	local start = self.pos
+	if self:peek() == "0" and (self:peek(1) == "x" or self:peek(1) == "X") then
+		self:advance(); self:advance()
+		while self:peek() and self:peek():match("[0-9a-fA-F]") do self:advance() end
+		if self:peek() == "." then
+			self:advance()
+			while self:peek() and self:peek():match("[0-9a-fA-F]") do self:advance() end
+		end
+		if self:peek() == "p" or self:peek() == "P" then
+			self:advance()
+			if self:peek() == "+" or self:peek() == "-" then self:advance() end
+			while isDigit(self:peek()) do self:advance() end
+		end
+		return tonumber(self.src:sub(start, self.pos - 1))
+	end
+	while isDigit(self:peek()) do self:advance() end
+	if self:peek() == "." then
+		self:advance()
+		while isDigit(self:peek()) do self:advance() end
+	end
+	if self:peek() == "e" or self:peek() == "E" then
+		self:advance()
+		if self:peek() == "+" or self:peek() == "-" then self:advance() end
+		while isDigit(self:peek()) do self:advance() end
+	end
+	return tonumber(self.src:sub(start, self.pos - 1))
+end
+
+local function tryThreeCharOps(self, c)
+	if c == "." and self:peek(1) == "." and self:peek(2) == "." then
+		self:advance(); self:advance(); self:advance()
+		return "..."
+	end
+	return nil
+end
+
+function Lexer:tokenize()
+	while true do
+		self:skipWhitespaceAndComments()
+		local line = self.line
+		local c = self:peek()
+		if c == nil then
+			table.insert(self.tokens, { type = "eof", value = nil, line = line })
+			break
+		end
+
+		if isAlpha(c) then
+			local start = self.pos
+			while isAlnum(self:peek()) do self:advance() end
+			local word = self.src:sub(start, self.pos - 1)
+			if KEYWORDS[word] then
+				table.insert(self.tokens, { type = word, value = word, line = line })
+			else
+				table.insert(self.tokens, { type = "name", value = word, line = line })
+			end
+		elseif isDigit(c) or (c == "." and isDigit(self:peek(1))) then
+			local n = self:readNumber()
+			table.insert(self.tokens, { type = "number", value = n, line = line })
+		elseif c == "\"" or c == "'" then
+			self:advance()
+			local s = self:readString(c)
+			table.insert(self.tokens, { type = "string", value = s, line = line })
+		elseif c == "[" and (self:peek(1) == "[" or self:peek(1) == "=") then
+			local savedPos, savedLine = self.pos, self.line
+			local content = self:tryReadLongBracket()
+			if content ~= nil then
+				table.insert(self.tokens, { type = "string", value = content, line = line })
+			else
+				self.pos, self.line = savedPos, savedLine
+				self:advance()
+				table.insert(self.tokens, { type = "[", value = "[", line = line })
+			end
+		else
+			local three = tryThreeCharOps(self, c)
+			if three then
+				table.insert(self.tokens, { type = three, value = three, line = line })
+			else
+				local two = c .. (self:peek(1) or "")
+				if two == "==" or two == "~=" or two == "<=" or two == ">=" or two == ".." then
+					self:advance(); self:advance()
+					table.insert(self.tokens, { type = two, value = two, line = line })
+				else
+					self:advance()
+					if c:match("[%+%-%*%/%%%^#<>=%(%)%{%}%[%]:;,%.]") then
+						table.insert(self.tokens, { type = c, value = c, line = line })
+					else
+						self:errorf("unexpected character '%s'", c)
+					end
+				end
+			end
+		end
+	end
+	return self.tokens
+end
+
+return Lexer
+end)()
+
+local Parser = (function()
+-- ============================================================
+-- LuauVM :: Parser
+-- Recursive-descent parser. Produces an AST of plain tables.
+-- ============================================================
+
+local Parser = {}
+
+-- binary operator precedence (higher binds tighter); .. and ^ are right-assoc
+local BINOP_PREC = {
+	["or"] = 1,
+	["and"] = 2,
+	["<"] = 3, [">"] = 3, ["<="] = 3, [">="] = 3, ["~="] = 3, ["=="] = 3,
+	[".."] = 4,
+	["+"] = 5, ["-"] = 5,
+	["*"] = 6, ["/"] = 6, ["%"] = 6,
+	["^"] = 8,
+}
+local RIGHT_ASSOC = { [".."] = true, ["^"] = true }
+local UNARY_PREC = 7
+
+function Parser.new(tokens)
+	local self = setmetatable({}, { __index = Parser })
+	self.tokens = tokens
+	self.pos = 1
+	return self
+end
+
+function Parser:cur()
+	return self.tokens[self.pos]
+end
+
+function Parser:check(ttype)
+	return self:cur().type == ttype
+end
+
+function Parser:advance()
+	local t = self:cur()
+	if t.type ~= "eof" then self.pos = self.pos + 1 end
+	return t
+end
+
+function Parser:expect(ttype, what)
+	if not self:check(ttype) then
+		local t = self:cur()
+		error(("LuauVM parse error [line %d]: expected %s, got '%s'")
+			:format(t.line, what or ("'" .. ttype .. "'"), tostring(t.value or t.type)), 0)
+	end
+	return self:advance()
+end
+
+function Parser:match(ttype)
+	if self:check(ttype) then
+		return self:advance()
+	end
+	return nil
+end
+
+-- ===================== Blocks / Statements =====================
+
+local BLOCK_END = {
+	["end"] = true, ["else"] = true, ["elseif"] = true, ["until"] = true, ["eof"] = true,
+}
+
+function Parser:parseChunk()
+	local block = self:parseBlock()
+	self:expect("eof", "<eof>")
+	return block
+end
+
+function Parser:parseBlock()
+	local stmts = {}
+	while not BLOCK_END[self:cur().type] do
+		if self:check("return") then
+			table.insert(stmts, self:parseReturn())
+			break -- return must be last statement in block
+		end
+		local stmt = self:parseStatement()
+		if stmt then table.insert(stmts, stmt) end
+	end
+	return { type = "Block", body = stmts }
+end
+
+function Parser:parseReturn()
+	local line = self:cur().line
+	self:expect("return")
+	local exprs = {}
+	if not BLOCK_END[self:cur().type] and not self:check(";") then
+		exprs = self:parseExprList()
+	end
+	self:match(";")
+	return { type = "Return", args = exprs, line = line }
+end
+
+function Parser:parseStatement()
+	local t = self:cur()
+	if t.type == ";" then self:advance(); return nil end
+	if t.type == "if" then return self:parseIf() end
+	if t.type == "while" then return self:parseWhile() end
+	if t.type == "do" then
+		self:advance()
+		local block = self:parseBlock()
+		self:expect("end")
+		return { type = "Do", body = block, line = t.line }
+	end
+	if t.type == "for" then return self:parseFor() end
+	if t.type == "repeat" then return self:parseRepeat() end
+	if t.type == "function" then return self:parseFunctionStat() end
+	if t.type == "local" then return self:parseLocal() end
+	if t.type == "break" then self:advance(); return { type = "Break", line = t.line } end
+	if t.type == "continue" then self:advance(); return { type = "Continue", line = t.line } end
+	return self:parseExprStat()
+end
+
+function Parser:parseIf()
+	local line = self:cur().line
+	self:expect("if")
+	local clauses = {}
+	local cond = self:parseExpr()
+	self:expect("then")
+	local body = self:parseBlock()
+	table.insert(clauses, { cond = cond, body = body })
+	while self:check("elseif") do
+		self:advance()
+		local c = self:parseExpr()
+		self:expect("then")
+		local b = self:parseBlock()
+		table.insert(clauses, { cond = c, body = b })
+	end
+	local elseBody = nil
+	if self:match("else") then
+		elseBody = self:parseBlock()
+	end
+	self:expect("end")
+	return { type = "If", clauses = clauses, elseBody = elseBody, line = line }
+end
+
+function Parser:parseWhile()
+	local line = self:cur().line
+	self:expect("while")
+	local cond = self:parseExpr()
+	self:expect("do")
+	local body = self:parseBlock()
+	self:expect("end")
+	return { type = "While", cond = cond, body = body, line = line }
+end
+
+function Parser:parseRepeat()
+	local line = self:cur().line
+	self:expect("repeat")
+	local body = self:parseBlock()
+	self:expect("until")
+	local cond = self:parseExpr()
+	return { type = "Repeat", cond = cond, body = body, line = line }
+end
+
+function Parser:skipAttribute()
+	-- Luau local attributes: local x <const> = 1
+	if self:match("<") then
+		self:expect("name")
+		self:expect(">")
+	end
+end
+
+-- Tolerates (and discards) a simple Luau type annotation so scripts
+-- written in a typed style still parse. Only safe in contexts with a
+-- clear terminator (parameter lists, local declarations) - function
+-- return-type annotations are NOT supported since there is no
+-- unambiguous terminator before the body begins.
+function Parser:skipTypeAnnotation()
+	if not self:match(":") then return end
+	local depth = 0
+	while true do
+		local t = self:cur()
+		if t.type == "eof" then break end
+		if depth == 0 and (t.type == "," or t.type == ")" or t.type == "=") then
+			break
+		end
+		if t.type == "(" or t.type == "{" or t.type == "<" then
+			depth = depth + 1
+		elseif t.type == ")" or t.type == "}" or t.type == ">" then
+			depth = depth - 1
+		end
+		self:advance()
+	end
+end
+
+function Parser:parseFor()
+	local line = self:cur().line
+	self:expect("for")
+	local firstName = self:expect("name").value
+	if self:check("=") then
+		self:advance()
+		local start = self:parseExpr()
+		self:expect(",")
+		local stop = self:parseExpr()
+		local step = nil
+		if self:match(",") then step = self:parseExpr() end
+		self:expect("do")
+		local body = self:parseBlock()
+		self:expect("end")
+		return { type = "NumericFor", var = firstName, start = start, stop = stop, step = step, body = body, line = line }
+	else
+		local names = { firstName }
+		while self:match(",") do
+			table.insert(names, self:expect("name").value)
+		end
+		self:expect("in")
+		local exprs = self:parseExprList()
+		self:expect("do")
+		local body = self:parseBlock()
+		self:expect("end")
+		return { type = "GenericFor", names = names, exprs = exprs, body = body, line = line }
+	end
+end
+
+function Parser:parseFunctionStat()
+	local line = self:cur().line
+	self:expect("function")
+	-- funcname: Name {'.' Name} [':' Name]
+	local target = { type = "Name", name = self:expect("name").value, line = line }
+	local isMethod = false
+	while self:check(".") or self:check(":") do
+		local sep = self:advance().type
+		local key = self:expect("name").value
+		target = { type = "Index", object = target, key = { type = "String", value = key }, line = line }
+		if sep == ":" then isMethod = true; break end
+	end
+	local fn = self:parseFunctionBody(isMethod, line)
+	return { type = "Assign", targets = { target }, values = { fn }, line = line }
+end
+
+function Parser:parseFunctionBody(isMethod, line)
+	self:expect("(")
+	local params = {}
+	if isMethod then table.insert(params, "self") end
+	local isVararg = false
+	if not self:check(")") then
+		repeat
+			if self:check("...") then
+				self:advance()
+				isVararg = true
+				self:skipTypeAnnotation()
+				break
+			end
+			table.insert(params, self:expect("name").value)
+			self:skipTypeAnnotation()
+		until not self:match(",")
+	end
+	self:expect(")")
+	local body = self:parseBlock()
+	self:expect("end")
+	return { type = "Function", params = params, isVararg = isVararg, body = body, line = line }
+end
+
+function Parser:parseLocal()
+	local line = self:cur().line
+	self:expect("local")
+	if self:match("function") then
+		local name = self:expect("name").value
+		local fn = self:parseFunctionBody(false, line)
+		return { type = "LocalFunction", name = name, func = fn, line = line }
+	end
+	local names = { self:expect("name").value }
+	self:skipAttribute()
+	self:skipTypeAnnotation()
+	while self:match(",") do
+		table.insert(names, self:expect("name").value)
+		self:skipAttribute()
+		self:skipTypeAnnotation()
+	end
+	local values = {}
+	if self:match("=") then
+		values = self:parseExprList()
+	end
+	return { type = "Local", names = names, values = values, line = line }
+end
+
+function Parser:parseExprStat()
+	local line = self:cur().line
+	local expr = self:parseSuffixedExpr()
+	if self:check("=") or self:check(",") then
+		local targets = { expr }
+		while self:match(",") do
+			table.insert(targets, self:parseSuffixedExpr())
+		end
+		self:expect("=")
+		local values = self:parseExprList()
+		return { type = "Assign", targets = targets, values = values, line = line }
+	end
+	if expr.type ~= "Call" and expr.type ~= "MethodCall" then
+		error(("LuauVM parse error [line %d]: expression statements must be function calls"):format(line), 0)
+	end
+	return { type = "ExprStat", expr = expr, line = line }
+end
+
+-- ===================== Expressions =====================
+
+function Parser:parseExprList()
+	local list = { self:parseExpr() }
+	while self:match(",") do
+		table.insert(list, self:parseExpr())
+	end
+	return list
+end
+
+function Parser:parseExpr()
+	return self:parseBinExpr(0)
+end
+
+function Parser:parseBinExpr(minPrec)
+	local left = self:parseUnaryExpr()
+	while true do
+		local t = self:cur()
+		local prec = BINOP_PREC[t.type]
+		if not prec or prec < minPrec then break end
+		local op = self:advance().type
+		local nextMin = RIGHT_ASSOC[op] and prec or (prec + 1)
+		local right = self:parseBinExpr(nextMin)
+		left = { type = "BinOp", op = op, left = left, right = right, line = t.line }
+	end
+	return left
+end
+
+function Parser:parseUnaryExpr()
+	local t = self:cur()
+	if t.type == "not" or t.type == "-" or t.type == "#" then
+		self:advance()
+		local operand = self:parseBinExpr(UNARY_PREC)
+		return { type = "UnOp", op = t.type, operand = operand, line = t.line }
+	end
+	return self:parsePowExpr()
+end
+
+function Parser:parsePowExpr()
+	-- simple primary/suffixed expr; '^' handled by precedence climbing itself
+	return self:parseSimpleExpr()
+end
+
+function Parser:parseSimpleExpr()
+	local t = self:cur()
+	if t.type == "number" then self:advance(); return { type = "Number", value = t.value, line = t.line } end
+	if t.type == "string" then self:advance(); return { type = "String", value = t.value, line = t.line } end
+	if t.type == "nil" then self:advance(); return { type = "Nil", line = t.line } end
+	if t.type == "true" then self:advance(); return { type = "Bool", value = true, line = t.line } end
+	if t.type == "false" then self:advance(); return { type = "Bool", value = false, line = t.line } end
+	if t.type == "..." then self:advance(); return { type = "Vararg", line = t.line } end
+	if t.type == "function" then
+		self:advance()
+		return self:parseFunctionBody(false, t.line)
+	end
+	if t.type == "{" then return self:parseTableConstructor() end
+	return self:parseSuffixedExpr()
+end
+
+function Parser:parsePrimaryExpr()
+	local t = self:cur()
+	if t.type == "(" then
+		self:advance()
+		local e = self:parseExpr()
+		self:expect(")")
+		return { type = "Paren", expr = e, line = t.line }
+	end
+	if t.type == "name" then
+		self:advance()
+		return { type = "Name", name = t.value, line = t.line }
+	end
+	error(("LuauVM parse error [line %d]: unexpected symbol near '%s'"):format(t.line, tostring(t.value or t.type)), 0)
+end
+
+function Parser:parseSuffixedExpr()
+	local expr = self:parsePrimaryExpr()
+	while true do
+		local t = self:cur()
+		if t.type == "." then
+			self:advance()
+			local key = self:expect("name").value
+			expr = { type = "Index", object = expr, key = { type = "String", value = key }, line = t.line }
+		elseif t.type == "[" then
+			self:advance()
+			local key = self:parseExpr()
+			self:expect("]")
+			expr = { type = "Index", object = expr, key = key, line = t.line }
+		elseif t.type == ":" then
+			self:advance()
+			local method = self:expect("name").value
+			local args = self:parseCallArgs()
+			expr = { type = "MethodCall", object = expr, method = method, args = args, line = t.line }
+		elseif t.type == "(" or t.type == "string" or t.type == "{" then
+			local args = self:parseCallArgs()
+			expr = { type = "Call", func = expr, args = args, line = t.line }
+		else
+			break
+		end
+	end
+	return expr
+end
+
+function Parser:parseCallArgs()
+	local t = self:cur()
+	if t.type == "(" then
+		self:advance()
+		local args = {}
+		if not self:check(")") then
+			args = self:parseExprList()
+		end
+		self:expect(")")
+		return args
+	elseif t.type == "string" then
+		self:advance()
+		return { { type = "String", value = t.value, line = t.line } }
+	elseif t.type == "{" then
+		return { self:parseTableConstructor() }
+	end
+	error(("LuauVM parse error [line %d]: function arguments expected"):format(t.line), 0)
+end
+
+function Parser:parseTableConstructor()
+	local line = self:cur().line
+	self:expect("{")
+	local fields = {}
+	while not self:check("}") do
+		if self:check("[") then
+			self:advance()
+			local key = self:parseExpr()
+			self:expect("]")
+			self:expect("=")
+			local value = self:parseExpr()
+			table.insert(fields, { kind = "keyed", key = key, value = value })
+		elseif self:check("name") and self.tokens[self.pos + 1].type == "=" then
+			local key = self:advance().value
+			self:advance() -- '='
+			local value = self:parseExpr()
+			table.insert(fields, { kind = "named", key = key, value = value })
+		else
+			local value = self:parseExpr()
+			table.insert(fields, { kind = "positional", value = value })
+		end
+		if not (self:match(",") or self:match(";")) then break end
+	end
+	self:expect("}")
+	return { type = "Table", fields = fields, line = line }
+end
+
+return Parser
+end)()
+
+local Interp = (function()
+-- ============================================================
+-- LuauVM :: Interpreter
+-- Executes an AST produced by the Parser. Values are native
+-- Luau values; tables are real Luau tables (so real metatables,
+-- setmetatable/getmetatable/coroutine.* all just work).
+-- ============================================================
+
+local Interp = {}
+
+-- ----------------- Environments -----------------
+
+local function newEnv(parent)
+	return { vars = {}, parent = parent }
+end
+
+local function envDeclare(env, name, value)
+	env.vars[name] = { value = value }
+end
+
+local function envLookupCell(env, name)
+	local e = env
+	while e do
+		local cell = e.vars[name]
+		if cell then return cell end
+		e = e.parent
+	end
+	return nil
+end
+
+-- ----------------- Error helper -----------------
+
+local function rt_error(line, fmt, ...)
+	error(("LuauVM runtime error [line %s]: %s"):format(tostring(line), fmt:format(...)), 0)
+end
+
+-- ----------------- Arithmetic / indexing helpers -----------------
+--
+-- Interpreted values are REAL native Luau values (numbers, strings,
+-- real tables, and real Roblox types like Vector3/Instance/CFrame).
+-- Rather than reimplementing metamethod dispatch and operator
+-- coercion ourselves (and inevitably missing cases - Roblox's
+-- datatypes overload +, -, .., indexing, etc. in ways we can't see
+-- into), we delegate to Luau's own operators via pcall. This means
+-- __index/__newindex/__add/__eq/... on plain tables AND native
+-- Vector3/CFrame/Color3/Instance behavior both just work correctly,
+-- for free, with no special-casing.
+
+local function toNumberStrict(v, line, opname)
+	if type(v) == "number" then return v end
+	if type(v) == "string" then
+		local n = tonumber(v)
+		if n then return n end
+	end
+	rt_error(line, "attempt to perform arithmetic (%s) on a %s value", opname, type(v))
+end
+
+local ARITH_FN = {
+	["+"] = function(a, b) return a + b end,
+	["-"] = function(a, b) return a - b end,
+	["*"] = function(a, b) return a * b end,
+	["/"] = function(a, b) return a / b end,
+	["%"] = function(a, b) return a % b end,
+	["^"] = function(a, b) return a ^ b end,
+}
+
+local function arith(op, a, b, line)
+	local ok, result = pcall(ARITH_FN[op], a, b)
+	if ok then return result end
+	rt_error(line, "attempt to perform arithmetic (%s) on %s and %s values", op, type(a), type(b))
+end
+
+local function concat(a, b, line)
+	local ok, result = pcall(function(x, y) return x .. y end, a, b)
+	if ok then return result end
+	rt_error(line, "attempt to concatenate %s and %s values", type(a), type(b))
+end
+
+local function luauEquals(a, b)
+	return a == b
+end
+
+local function luauLess(a, b, line)
+	local ok, result = pcall(function(x, y) return x < y end, a, b)
+	if ok then return result end
+	rt_error(line, "attempt to compare %s with %s", type(a), type(b))
+end
+
+local function luauLessEq(a, b, line)
+	local ok, result = pcall(function(x, y) return x <= y end, a, b)
+	if ok then return result end
+	rt_error(line, "attempt to compare %s with %s", type(a), type(b))
+end
+
+local function isTruthy(v)
+	return v ~= nil and v ~= false
+end
+
+local function luauIndex(t, k, line)
+	if t == nil then
+		rt_error(line, "attempt to index nil value")
+	end
+	local ok, v = pcall(function(obj, key) return obj[key] end, t, k)
+	if ok then return v end
+	rt_error(line, "attempt to index a %s value", type(t))
+end
+
+local function luauNewIndex(t, k, v, line)
+	if k == nil then rt_error(line, "table index is nil") end
+	local ok, err = pcall(function(obj, key, val) obj[key] = val end, t, k, v)
+	if not ok then
+		rt_error(line, "attempt to index a %s value", type(t))
+	end
+end
+
+-- ----------------- Signals for control flow -----------------
+-- executeBlock / executeStatement return: signal, ...
+--   "normal"   -> fell through
+--   "return"   -> ... are the return values
+--   "break"    -> loop break
+--   "continue" -> loop continue
+
+-- ----------------- Interpreter object -----------------
+
+function Interp.new(globalEnv, debugName)
+	local self = setmetatable({}, { __index = Interp })
+	self.globalEnv = globalEnv
+	self.debugName = debugName or "LuauVM"
+	return self
+end
+
+-- Evaluate a list of expressions, expanding the LAST one fully
+-- (for calls / varargs) into a flat array of values.
+function Interp:evalExprListExpand(exprs, env)
+	local out = {}
+	local n = #exprs
+	for i = 1, n do
+		local e = exprs[i]
+		if i == n and (e.type == "Call" or e.type == "MethodCall" or e.type == "Vararg") then
+			local vals = { self:evalMulti(e, env) }
+			for _, v in ipairs(vals) do table.insert(out, v) end
+		else
+			table.insert(out, (self:eval(e, env)))
+		end
+	end
+	return out
+end
+
+-- Evaluate an expression that may produce multiple values; returns all of them.
+function Interp:evalMulti(node, env)
+	local t = node.type
+	if t == "Call" then
+		local fn = self:eval(node.func, env)
+		local args = self:evalExprListExpand(node.args, env)
+		if type(fn) ~= "function" then
+			rt_error(node.line, "attempt to call a %s value", type(fn))
+		end
+		return fn(table.unpack(args))
+	elseif t == "MethodCall" then
+		local obj = self:eval(node.object, env)
+		local fn = luauIndex(obj, node.method, node.line)
+		if type(fn) ~= "function" then
+			rt_error(node.line, "attempt to call a %s value (method '%s')", type(fn), node.method)
+		end
+		local args = self:evalExprListExpand(node.args, env)
+		return fn(obj, table.unpack(args))
+	elseif t == "Vararg" then
+		local cell = envLookupCell(env, "...")
+		if not cell then return end
+		return table.unpack(cell.value, 1, cell.value.n)
+	else
+		return self:eval(node, env)
+	end
+end
+
+-- Evaluate an expression to a SINGLE value.
+function Interp:eval(node, env)
+	local t = node.type
+	if t == "Number" then return node.value end
+	if t == "String" then return node.value end
+	if t == "Nil" then return nil end
+	if t == "Bool" then return node.value end
+	if t == "Vararg" then
+		local cell = envLookupCell(env, "...")
+		if not cell then return nil end
+		return cell.value[1]
+	end
+	if t == "Name" then
+		local cell = envLookupCell(env, node.name)
+		if cell then return cell.value end
+		return self.globalEnv.vars[node.name] and self.globalEnv.vars[node.name].value or nil
+	end
+	if t == "Paren" then
+		return (self:eval(node.expr, env))
+	end
+	if t == "Index" then
+		local obj = self:eval(node.object, env)
+		local key = self:eval(node.key, env)
+		return luauIndex(obj, key, node.line)
+	end
+	if t == "Call" or t == "MethodCall" then
+		return (self:evalMulti(node, env))
+	end
+	if t == "Function" then
+		return self:makeClosure(node, env)
+	end
+	if t == "Table" then
+		return self:evalTable(node, env)
+	end
+	if t == "BinOp" then
+		return self:evalBinOp(node, env)
+	end
+	if t == "UnOp" then
+		return self:evalUnOp(node, env)
+	end
+	rt_error(node.line, "unknown expression node '%s'", tostring(t))
+end
+
+function Interp:evalBinOp(node, env)
+	local op = node.op
+	if op == "and" then
+		local l = self:eval(node.left, env)
+		if not isTruthy(l) then return l end
+		return self:eval(node.right, env)
+	elseif op == "or" then
+		local l = self:eval(node.left, env)
+		if isTruthy(l) then return l end
+		return self:eval(node.right, env)
+	end
+	local a = self:eval(node.left, env)
+	local b = self:eval(node.right, env)
+	if op == ".." then return concat(a, b, node.line) end
+	if op == "==" then return luauEquals(a, b) end
+	if op == "~=" then return not luauEquals(a, b) end
+	if op == "<" then return luauLess(a, b, node.line) end
+	if op == ">" then return luauLess(b, a, node.line) end
+	if op == "<=" then return luauLessEq(a, b, node.line) end
+	if op == ">=" then return luauLessEq(b, a, node.line) end
+	return arith(op, a, b, node.line)
+end
+
+function Interp:evalUnOp(node, env)
+	local v = self:eval(node.operand, env)
+	if node.op == "not" then return not isTruthy(v) end
+	if node.op == "-" then
+		local ok, result = pcall(function(x) return -x end, v)
+		if ok then return result end
+		rt_error(node.line, "attempt to perform arithmetic (unm) on a %s value", type(v))
+	end
+	if node.op == "#" then
+		local ok, result = pcall(function(x) return #x end, v)
+		if ok then return result end
+		rt_error(node.line, "attempt to get length of a %s value", type(v))
+	end
+end
+
+function Interp:evalTable(node, env)
+	local t = {}
+	local idx = 1
+	local n = #node.fields
+	for i, field in ipairs(node.fields) do
+		if field.kind == "positional" then
+			if i == n and (field.value.type == "Call" or field.value.type == "MethodCall" or field.value.type == "Vararg") then
+				local vals = { self:evalMulti(field.value, env) }
+				for _, v in ipairs(vals) do
+					t[idx] = v
+					idx = idx + 1
+				end
+			else
+				t[idx] = self:eval(field.value, env)
+				idx = idx + 1
+			end
+		elseif field.kind == "named" then
+			t[field.key] = self:eval(field.value, env)
+		elseif field.kind == "keyed" then
+			local k = self:eval(field.key, env)
+			t[k] = self:eval(field.value, env)
+		end
+	end
+	return t
+end
+
+-- Build a real Luau closure from a Function AST node + captured env.
+function Interp:makeClosure(node, defEnv)
+	local interp = self
+	local closure = function(...)
+		local callEnv = newEnv(defEnv)
+		local nargs = select("#", ...)
+		local args = { ... }
+		for i, pname in ipairs(node.params) do
+			envDeclare(callEnv, pname, args[i])
+		end
+		if node.isVararg then
+			local extra = {}
+			local extraN = 0
+			for i = #node.params + 1, nargs do
+				extraN = extraN + 1
+				extra[extraN] = args[i]
+			end
+			extra.n = extraN
+			envDeclare(callEnv, "...", extra)
+		end
+		local signal, a, b, c, d, e, f, g, h = interp:execBlock(node.body, callEnv)
+		if signal == "return" then
+			return a, b, c, d, e, f, g, h
+		end
+		return
+	end
+	return closure
+end
+
+-- ----------------- Statements -----------------
+
+-- Returns signal, ... (see comment above)
+function Interp:execBlock(block, env)
+	local scopeEnv = newEnv(env)
+	return self:execStmts(block.body, scopeEnv)
+end
+
+function Interp:execStmts(stmts, env)
+	for _, stmt in ipairs(stmts) do
+		local signal, a, b, c, d, e, f, g, h = self:execStatement(stmt, env)
+		if signal ~= "normal" then
+			return signal, a, b, c, d, e, f, g, h
+		end
+	end
+	return "normal"
+end
+
+function Interp:execStatement(node, env)
+	local t = node.type
+
+	if t == "ExprStat" then
+		self:evalMulti(node.expr, env)
+		return "normal"
+	end
+
+	if t == "Local" then
+		local values = self:evalExprListExpand(node.values, env)
+		for i, name in ipairs(node.names) do
+			envDeclare(env, name, values[i])
+		end
+		return "normal"
+	end
+
+	if t == "LocalFunction" then
+		envDeclare(env, node.name, nil)
+		local fn = self:makeClosure(node.func, env)
+		envLookupCell(env, node.name).value = fn
+		return "normal"
+	end
+
+	if t == "Assign" then
+		local values = self:evalExprListExpand(node.values, env)
+		for i, target in ipairs(node.targets) do
+			local v = values[i]
+			if target.type == "Name" then
+				local cell = envLookupCell(env, target.name)
+				if cell then
+					cell.value = v
+				else
+					self.globalEnv.vars[target.name] = { value = v }
+				end
+			elseif target.type == "Index" then
+				local obj = self:eval(target.object, env)
+				local key = self:eval(target.key, env)
+				luauNewIndex(obj, key, v, target.line)
+			else
+				rt_error(node.line, "invalid assignment target")
+			end
+		end
+		return "normal"
+	end
+
+	if t == "If" then
+		for _, clause in ipairs(node.clauses) do
+			if isTruthy(self:eval(clause.cond, env)) then
+				return self:execBlock(clause.body, env)
+			end
+		end
+		if node.elseBody then
+			return self:execBlock(node.elseBody, env)
+		end
+		return "normal"
+	end
+
+	if t == "While" then
+		while isTruthy(self:eval(node.cond, env)) do
+			local signal, a, b, c, d = self:execBlock(node.body, env)
+			if signal == "break" then break end
+			if signal == "return" then return signal, a, b, c, d end
+		end
+		return "normal"
+	end
+
+	if t == "Repeat" then
+		while true do
+			local scopeEnv = newEnv(env)
+			local signal, a, b, c, d = self:execStmts(node.body.body, scopeEnv)
+			if signal == "break" then break end
+			if signal == "return" then return signal, a, b, c, d end
+			if isTruthy(self:eval(node.cond, scopeEnv)) then break end
+		end
+		return "normal"
+	end
+
+	if t == "NumericFor" then
+		local start = toNumberStrict(self:eval(node.start, env), node.line, "for")
+		local stop = toNumberStrict(self:eval(node.stop, env), node.line, "for")
+		local step = node.step and toNumberStrict(self:eval(node.step, env), node.line, "for") or 1
+		local i = start
+		while (step > 0 and i <= stop) or (step < 0 and i >= stop) do
+			local scopeEnv = newEnv(env)
+			envDeclare(scopeEnv, node.var, i)
+			local signal, a, b, c, d = self:execStmts(node.body.body, scopeEnv)
+			if signal == "break" then break end
+			if signal == "return" then return signal, a, b, c, d end
+			i = i + step
+		end
+		return "normal"
+	end
+
+	if t == "GenericFor" then
+		local vals = self:evalExprListExpand(node.exprs, env)
+		local iterFn, state, control = vals[1], vals[2], vals[3]
+		while true do
+			local results = { iterFn(state, control) }
+			if results[1] == nil then break end
+			control = results[1]
+			local scopeEnv = newEnv(env)
+			for i, name in ipairs(node.names) do
+				envDeclare(scopeEnv, name, results[i])
+			end
+			local signal, a, b, c, d = self:execStmts(node.body.body, scopeEnv)
+			if signal == "break" then break end
+			if signal == "return" then return signal, a, b, c, d end
+		end
+		return "normal"
+	end
+
+	if t == "Do" then
+		return self:execBlock(node.body, env)
+	end
+
+	if t == "Return" then
+		local vals = self:evalExprListExpand(node.args, env)
+		return "return", table.unpack(vals)
+	end
+
+	if t == "Break" then
+		return "break"
+	end
+
+	if t == "Continue" then
+		return "continue"
+	end
+
+	rt_error(node.line, "unknown statement node '%s'", tostring(t))
+end
+
+Interp._newEnv = newEnv
+Interp._envDeclare = envDeclare
+
+return Interp
+end)()
+
+local Stdlib = (function()
+-- ============================================================
+-- LuauVM :: Standard Library Bridge
+-- Interpreted functions are REAL Luau closures, so we can just
+-- hand through the real std libraries directly - no reimplementation
+-- needed, and things like coroutine.wrap(interpretedFn) just work.
+-- ============================================================
+
+local Stdlib = {}
+
+-- Build a fresh global table. `extra` lets the embedder inject
+-- game-specific globals (e.g. a sandboxed subset of game/workspace).
+function Stdlib.buildGlobals(extra)
+	local G = {}
+
+	G.print = print
+	G.warn = warn
+	G.type = type
+	G.typeof = typeof or type
+	G.tostring = tostring
+	G.tonumber = tonumber
+	G.pairs = pairs
+	G.ipairs = ipairs
+	G.next = next
+	G.select = select
+	G.unpack = table.unpack
+	G.rawget = rawget
+	G.rawset = rawset
+	G.rawequal = rawequal
+	G.rawlen = rawlen
+	G.setmetatable = setmetatable
+	G.getmetatable = getmetatable
+	G.assert = assert
+	G.error = error
+	G.pcall = pcall
+	G.xpcall = xpcall
+
+	G.math = math
+	G.string = string
+	G.table = table
+	G.os = os
+	G.bit32 = bit32
+
+	if coroutine then G.coroutine = coroutine end
+	if task then G.task = task end
+	if Instance then G.Instance = Instance end
+	if Vector3 then G.Vector3 = Vector3 end
+	if Vector2 then G.Vector2 = Vector2 end
+	if CFrame then G.CFrame = CFrame end
+	if Color3 then G.Color3 = Color3 end
+	if UDim2 then G.UDim2 = UDim2 end
+	if UDim then G.UDim = UDim end
+	if Enum then G.Enum = Enum end
+	if game then G.game = game end
+	if workspace then G.workspace = workspace end
+
+	G._G = {}
+	G._VERSION = "LuauVM 1.0"
+
+	if extra then
+		for k, v in pairs(extra) do
+			G[k] = v
+		end
+	end
+
+	return G
+end
+
+return Stdlib
+end)()
+
+local Serialize = (function()
+-- ============================================================
+-- LuauVM :: Serializer
+-- Turns an AST into an opaque blob (not Luau source) that can
+-- be shipped inside the game instead of readable script text.
+-- This is obfuscation, not encryption: anyone with your VM
+-- source and enough patience can still write a decoder. It
+-- stops casual "open script, read logic" inspection, which is
+-- what matters for most games.
+-- ============================================================
+
+local Serialize = {}
+
+-- ----------------- generic length-prefixed value codec -----------------
+
+local function encodeValue(buf, v)
+	local t = type(v)
+	if v == nil then
+		table.insert(buf, "N")
+	elseif t == "boolean" then
+		table.insert(buf, v and "T" or "F")
+	elseif t == "number" then
+		local s = string.format("%.17g", v)
+		table.insert(buf, "D" .. #s .. ":" .. s)
+	elseif t == "string" then
+		table.insert(buf, "S" .. #v .. ":" .. v)
+	elseif t == "table" then
+		-- count entries first
+		local count = 0
+		for _ in pairs(v) do count = count + 1 end
+		table.insert(buf, "{" .. count .. ":")
+		for k, val in pairs(v) do
+			encodeValue(buf, k)
+			encodeValue(buf, val)
+		end
+		table.insert(buf, "}")
+	else
+		error("LuauVM serialize error: cannot serialize value of type " .. t, 0)
+	end
+end
+
+local function readUntil(str, pos, ch)
+	local s, e = str:find(ch, pos, true)
+	if not s then error("LuauVM deserialize error: malformed stream (expected '" .. ch .. "')", 0) end
+	return str:sub(pos, s - 1), e + 1
+end
+
+local decodeValue -- fwd decl
+
+local function decodeTable(str, pos)
+	local countStr, p = readUntil(str, pos, ":")
+	local count = tonumber(countStr)
+	local t = {}
+	for _ = 1, count do
+		local k
+		k, p = decodeValue(str, p)
+		local val
+		val, p = decodeValue(str, p)
+		t[k] = val
+	end
+	-- skip closing '}'
+	if str:sub(p, p) ~= "}" then
+		error("LuauVM deserialize error: malformed table terminator", 0)
+	end
+	return t, p + 1
+end
+
+decodeValue = function(str, pos)
+	local tag = str:sub(pos, pos)
+	if tag == "N" then
+		return nil, pos + 1
+	elseif tag == "T" then
+		return true, pos + 1
+	elseif tag == "F" then
+		return false, pos + 1
+	elseif tag == "D" then
+		local lenStr, p = readUntil(str, pos + 1, ":")
+		local len = tonumber(lenStr)
+		local s = str:sub(p, p + len - 1)
+		return tonumber(s), p + len
+	elseif tag == "S" then
+		local lenStr, p = readUntil(str, pos + 1, ":")
+		local len = tonumber(lenStr)
+		local s = str:sub(p, p + len - 1)
+		return s, p + len
+	elseif tag == "{" then
+		return decodeTable(str, pos + 1)
+	else
+		error("LuauVM deserialize error: unknown tag '" .. tostring(tag) .. "' at byte " .. pos, 0)
+	end
+end
+
+-- ----------------- XOR layer -----------------
+
+local function xorBytes(data, key)
+	if #key == 0 then return data end
+	local out = {}
+	local klen = #key
+	for i = 1, #data do
+		local dByte = string.byte(data, i)
+		local kByte = string.byte(key, ((i - 1) % klen) + 1)
+		out[i] = string.char(bit32.bxor(dByte, kByte))
+	end
+	return table.concat(out)
+end
+
+-- ----------------- base64 -----------------
+
+local B64_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+local function base64Encode(data)
+	local out = {}
+	local len = #data
+	local i = 1
+	while i <= len do
+		local b1 = string.byte(data, i)
+		local b2 = string.byte(data, i + 1)
+		local b3 = string.byte(data, i + 2)
+		local n = b1 * 65536 + (b2 or 0) * 256 + (b3 or 0)
+		local c1 = math.floor(n / 262144) % 64
+		local c2 = math.floor(n / 4096) % 64
+		local c3 = math.floor(n / 64) % 64
+		local c4 = n % 64
+		table.insert(out, B64_CHARS:sub(c1 + 1, c1 + 1))
+		table.insert(out, B64_CHARS:sub(c2 + 1, c2 + 1))
+		table.insert(out, b2 and B64_CHARS:sub(c3 + 1, c3 + 1) or "=")
+		table.insert(out, b3 and B64_CHARS:sub(c4 + 1, c4 + 1) or "=")
+		i = i + 3
+	end
+	return table.concat(out)
+end
+
+local B64_LOOKUP = {}
+for i = 1, #B64_CHARS do
+	B64_LOOKUP[B64_CHARS:sub(i, i)] = i - 1
+end
+
+local function base64Decode(str)
+	str = str:gsub("[^A-Za-z0-9+/=]", "")
+	local out = {}
+	local i = 1
+	local len = #str
+	while i <= len do
+		local c1 = B64_LOOKUP[str:sub(i, i)] or 0
+		local c2 = B64_LOOKUP[str:sub(i + 1, i + 1)] or 0
+		local s3 = str:sub(i + 2, i + 2)
+		local s4 = str:sub(i + 3, i + 3)
+		local c3 = B64_LOOKUP[s3]
+		local c4 = B64_LOOKUP[s4]
+		local n = c1 * 262144 + c2 * 4096 + (c3 or 0) * 64 + (c4 or 0)
+		local b1 = math.floor(n / 65536) % 256
+		local b2 = math.floor(n / 256) % 256
+		local b3 = n % 256
+		table.insert(out, string.char(b1))
+		if s3 ~= "=" and s3 ~= "" then table.insert(out, string.char(b2)) end
+		if s4 ~= "=" and s4 ~= "" then table.insert(out, string.char(b3)) end
+		i = i + 4
+	end
+	return table.concat(out)
+end
+
+-- ----------------- public API -----------------
+
+-- key: optional string used to XOR-scramble the blob. Keep this in
+-- your VM module (not in the blob) if you want any real obfuscation
+-- value - if the key ships alongside the blob it's decorative only.
+function Serialize.encode(ast, key)
+	local buf = {}
+	encodeValue(buf, ast)
+	local raw = table.concat(buf)
+	if key and #key > 0 then
+		raw = xorBytes(raw, key)
+	end
+	return base64Encode(raw)
+end
+
+function Serialize.decode(blob, key)
+	local raw = base64Decode(blob)
+	if key and #key > 0 then
+		raw = xorBytes(raw, key)
+	end
+	local ast = decodeValue(raw, 1)
+	return ast
+end
+
+return Serialize
+end)()
+
+-- 	LuauVM - a self-contained Luau interpreter you drop in as a ModuleScript.
+--
+-- 	WHAT THIS IS
+-- 	A lexer -> parser -> tree-walking interpreter pipeline that runs Luau-like
+-- 	source itself, instead of letting the Roblox engine run it directly. Your
+-- 	real logic is compiled into an AST and (optionally) shipped as an opaque
+-- 	blob (VM.CompileToBlob) rather than readable source, so a script dumper
+-- 	only finds "require(VM).RunBlob(blob, key)" - not your actual code.
+--
+-- 	WHAT THIS IS NOT
+-- 	- Not a bytecode/register VM like real Luau's - it's a tree-walking
+-- 	  interpreter, which is slower (expect ~5-20x native Luau) but far more
+-- 	  tractable to build and debug correctly.
+-- 	- Not unbreakable. Someone with your VM source and real patience can
+-- 	  write a deserializer and read the AST back out. It raises the bar a
+-- 	  lot (no readable source anywhere in the game) but doesn't make reverse
+-- 	  engineering impossible. Pair it with keeping anything truly sensitive
+-- 	  (loot tables, anti-cheat thresholds, etc.) server-side.
+-- 	- Does not support: goto/labels, coroutines yielding across interpreter
+-- 	  boundaries in unusual ways, function return-type annotations, or deep
+-- 	  generic type syntax. Simple parameter/local type annotations are
+-- 	  tolerated and ignored. <const>/<close> attributes are tolerated too.
+--
+-- 	USAGE (see example_usage.server.lua for a full walkthrough)
+-- 	local VM = require(path.to.LuauVM)
+--
+-- 	-- Run source directly (keeps readable text in the module, no
+-- 	-- protection, but useful for testing):
+-- 	VM.Run('local function greet(n) return "hi " .. n end print(greet("world"))')
+--
+-- 	-- Or compile once, ship only the blob:
+-- 	local blob = VM.CompileToBlob(sourceString, "my-secret-key")
+-- 	-- store `blob` as a plain string in your game, delete the source.
+-- 	VM.RunBlob(blob, "my-secret-key")
+--
+-- 	-- Provide extra globals (e.g. a sandboxed API) to interpreted code:
+-- 	VM.Run(source, { myApi = someTable })
+--
+
+
+local VM = {}
+
+-- Compile source -> AST. Throws (error) on lex/parse failure.
+function VM.Compile(source)
+	local tokens = Lexer.new(source):tokenize()
+	local ast = Parser.new(tokens):parseChunk()
+	return ast
+end
+
+-- Execute an already-compiled AST with the given extra globals + varargs.
+-- Returns whatever the chunk's top-level `return` produced.
+function VM.Execute(ast, extraGlobals, ...)
+	local globals = Stdlib.buildGlobals(extraGlobals)
+	-- globals live directly as the root env's vars
+	local root = { vars = {}, parent = nil }
+	for k, v in pairs(globals) do
+		root.vars[k] = { value = v }
+	end
+	local interp = Interp.new(root)
+
+	local varargTable = { ... }
+	varargTable.n = select("#", ...)
+	local topEnv = Interp._newEnv(root)
+	Interp._envDeclare(topEnv, "...", varargTable)
+
+	local signal, a, b, c, d, e, f, g, h = interp:execStmts(ast.body, topEnv)
+	if signal == "return" then
+		return a, b, c, d, e, f, g, h
+	end
+	return
+end
+
+-- Convenience: compile + execute source in one call.
+function VM.Run(source, extraGlobals, ...)
+	local ast = VM.Compile(source)
+	return VM.Execute(ast, extraGlobals, ...)
+end
+
+-- Safe variant: returns (true, ...) on success or (false, errorMessage).
+function VM.RunSafe(source, extraGlobals, ...)
+	return pcall(VM.Run, source, extraGlobals, ...)
+end
+
+-- Compile source and produce an opaque blob suitable for shipping in
+-- the game in place of the real source. `key` is an optional scramble
+-- key - keep it in the VM module, never alongside the blob.
+function VM.CompileToBlob(source, key)
+	local ast = VM.Compile(source)
+	return Serialize.encode(ast, key)
+end
+
+function VM.DecodeBlob(blob, key)
+	return Serialize.decode(blob, key)
+end
+
+function VM.RunBlob(blob, key, extraGlobals, ...)
+	local ast = Serialize.decode(blob, key)
+	return VM.Execute(ast, extraGlobals, ...)
+end
+
+VM._Lexer = Lexer
+VM._Parser = Parser
+VM._Interp = Interp
+VM._Stdlib = Stdlib
+VM._Serialize = Serialize
+
+return VM
